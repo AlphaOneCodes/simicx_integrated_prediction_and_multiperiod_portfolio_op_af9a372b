@@ -102,7 +102,8 @@ def generate_param_combinations(grid: Dict[str, List[Any]]) -> List[Dict[str, An
 def evaluate_params(
     ohlcv_df: pd.DataFrame,
     params: Dict[str, Any],
-    fixed_params: Dict[str, Any]
+    fixed_params: Dict[str, Any],
+    solver: str = 'pytorch'
 ) -> Tuple[float, float]:
     """Evaluate a parameter combination using signal_gen and trading_sim.
     
@@ -140,6 +141,7 @@ def evaluate_params(
                 epochs=int(all_params["epochs"]),
                 neumann_order=int(all_params["neumann_order"]),
                 initial_capital=float(DEFAULT_INITIAL_CAPITAL),
+                solver=solver,
             )
             
             # Check if trading sheet is valid and non-empty
@@ -193,10 +195,12 @@ def evaluate_params(
         
     except Exception as e:
         print(f"  Error evaluating params: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return float("-inf"), 0.0
 
 
-def run_grid_search(phase: str) -> Dict[str, Any]:
+def run_grid_search(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
     """Run grid search over parameter combinations.
     
     Loads training data, evaluates all parameter combinations using
@@ -206,6 +210,7 @@ def run_grid_search(phase: str) -> Dict[str, Any]:
         phase: Either 'limited' or 'full' - determines dataset size.
                'limited' uses a subset of tickers for faster tuning.
                'full' uses all available tickers.
+        solver: Optimization solver - 'pytorch' or 'cvxpy'. Default: 'pytorch'
         
     Returns:
         Dictionary containing:
@@ -262,7 +267,7 @@ def run_grid_search(phase: str) -> Dict[str, Any]:
         for k, v in params.items():
             print(f"    {k}: {v}")
         
-        sharpe, pnl = evaluate_params(ohlcv_df, params, FIXED_PARAMS)
+        sharpe, pnl = evaluate_params(ohlcv_df, params, FIXED_PARAMS, solver)
         
         result = {
             "params": params.copy(),
@@ -342,7 +347,7 @@ def save_best_params(params: Dict[str, Any], filepath: str) -> None:
     print(f"\nSaved best parameters to: {filepath_obj}")
 
 
-def tune(phase: str) -> Dict[str, Any]:
+def tune(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
     """Main tuning entry point.
     
     Runs grid search over the parameter space and saves the best
@@ -352,6 +357,8 @@ def tune(phase: str) -> Dict[str, Any]:
         phase: Either 'limited' or 'full' data phase.
                'limited' - faster tuning with subset of tickers
                'full' - complete tuning with all tickers
+        solver: Optimization solver - 'pytorch' (fast) or 'cvxpy' (accurate).
+                Default: 'pytorch'
         
     Returns:
         Dictionary with:
@@ -361,7 +368,7 @@ def tune(phase: str) -> Dict[str, Any]:
             - all_results: All evaluation results
     """
     # Run grid search
-    results = run_grid_search(phase=phase)
+    results = run_grid_search(phase=phase, solver=solver)
     
     # Extract best parameters
     best_params = results["best_params"]
@@ -529,6 +536,13 @@ def main() -> None:
         action="store_true",
         help="Run unit tests instead of tuning"
     )
+    parser.add_argument(
+        "--solver",
+        type=str,
+        default="pytorch",
+        choices=["pytorch", "cvxpy"],
+        help="Solver: 'pytorch' (fast, GPU) or 'cvxpy' (accurate, CPU). Default: pytorch"
+    )
     
     args = parser.parse_args()
     
@@ -542,7 +556,7 @@ def main() -> None:
         print("\nAll tests passed!")
     else:
         # Run hyperparameter tuning
-        results = tune(phase=args.phase)
+        results = tune(phase=args.phase, solver=args.solver)
         
         print("\n" + "=" * 60)
         print("TUNING COMPLETE")

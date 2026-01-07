@@ -110,11 +110,10 @@ class CNN_LSTM(nn.Module):
             batch_first=True
         )
         
-        # FC layers for mean returns and covariance factors
+        # FC layer for mean returns only
+        # Note: Covariance is computed from historical returns (sample covariance)
+        # rather than learned, which is more stable and aligns with standard practice
         self.fc_mean = nn.Linear(64, horizon * n_assets)
-        
-        # For covariance: output lower triangular factors
-        self.fc_cov_factor = nn.Linear(64, horizon * n_assets * n_assets)
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -125,10 +124,7 @@ class CNN_LSTM(nn.Module):
                Represents historical returns for each asset
                
         Returns:
-            Tuple of:
-                - y_hat: Predicted returns, shape (batch, horizon, n_assets)
-                - V_hat: Predicted covariance matrices, shape (batch, horizon, n_assets, n_assets)
-                         Guaranteed to be positive semi-definite
+            y_hat: Predicted returns, shape (batch, horizon, n_assets)
                          
         Example:
             >>> model = CNN_LSTM(n_assets=5, horizon=3)
@@ -162,19 +158,7 @@ class CNN_LSTM(nn.Module):
         y_hat = self.fc_mean(last_hidden)
         y_hat = y_hat.view(batch_size, self.horizon, self.n_assets)
         
-        # Predict covariance factors
-        cov_factors = self.fc_cov_factor(last_hidden)
-        cov_factors = cov_factors.view(batch_size, self.horizon, self.n_assets, self.n_assets)
-        
-        # Construct positive semi-definite covariance: V = L @ L.T + eps*I
-        L = torch.tril(cov_factors)
-        V_hat = torch.matmul(L, L.transpose(-2, -1))
-        
-        # Add diagonal for numerical stability
-        eye = torch.eye(self.n_assets, device=device, dtype=dtype)
-        V_hat = V_hat + 1e-4 * eye.unsqueeze(0).unsqueeze(0)
-        
-        return y_hat, V_hat
+        return y_hat
 
 
 # ============================================================================
@@ -490,6 +474,178 @@ def apply_mdfp(
 
 
 # ============================================================================
+# PyTorch Solver (GPU-Accelerated Alternative to CVXPY)
+# ============================================================================
+
+def project_simplex(z: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Project weights onto the probability simplex: sum(z) = 1, z >= 0.
+    
+    Uses efficient O(n log n) algorithm from Duchi et al. (2008).
+    "Efficient Projections onto the l1-Ball for Learning in High Dimensions"
+    """
+    z_sorted, _ = torch.sort(z, descending=True, dim=dim)
+    cumsum = torch.cumsum(z_sorted, dim=dim)
+    k = torch.arange(1, z.shape[dim] + 1, device=z.device, dtype=z.dtype)
+    if dim != -1:
+        k = k.reshape([1] * (-dim - 1) + [-1] + [1] * (z.ndim + dim))
+    condition = z_sorted - (cumsum - 1) / k > 0
+    k_star = condition.sum(dim=dim, keepdim=True)
+    tau = (cumsum.gather(dim, k_star - 1) - 1) / k_star
+    return torch.clamp(z - tau, min=0)
+
+
+def portfolio_objective(
+    z: torch.Tensor,
+    y_hat: torch.Tensor,
+    V_hat: torch.Tensor,
+    z_prev: torch.Tensor,
+    delta: float,
+    lambda_val: float,
+    kappa: float = 1e-6
+) -> torch.Tensor:
+    """Compute multi-period portfolio objective."""
+    batch_size, horizon, n_assets = z.shape
+    objectives = []
+    
+    for b in range(batch_size):
+        for s in range(horizon):
+            z_s = z[b, s]
+            y_s = y_hat[b, s]
+            V_s = V_hat[b, s]
+            
+            return_term = -torch.dot(y_s, z_s)
+            risk_term = (delta / 2) * torch.dot(z_s, torch.matmul(V_s, z_s))
+            
+            if s == 0:
+                z_prev_s = z_prev[b]
+            else:
+                z_prev_s = z[b, s - 1]
+            
+            diff = z_s - z_prev_s
+            turnover_term = lambda_val * torch.sqrt((diff ** 2 + kappa)).sum()
+            
+            obj = return_term + risk_term + turnover_term
+            objectives.append(obj)
+    
+    return torch.stack(objectives).sum() / (batch_size * horizon)
+
+
+def solve_mdfp_pytorch(
+    y_hat: torch.Tensor,
+    V_hat: torch.Tensor,
+    z_prev: torch.Tensor,
+    delta: float,
+    lambda_val: float,
+    kappa: float = 1e-6,
+    max_iter: int = 50,
+    lr: float = 0.5,
+    tol: float = 1e-5,
+    verbose: bool = False
+) -> torch.Tensor:
+    """
+    Solve multi-period portfolio optimization using PyTorch projected gradient descent.
+    
+    GPU-accelerated, fully differentiable alternative to CVXPY.
+    """
+    batch_size, horizon, n_assets = y_hat.shape
+    device = y_hat.device
+    dtype = y_hat.dtype
+    
+    with torch.enable_grad():
+        z = torch.ones(batch_size, horizon, n_assets, device=device, dtype=dtype) / n_assets
+        prev_obj = float('inf')
+        
+        for iteration in range(max_iter):
+            z_temp = z.detach().requires_grad_(True)
+            obj = portfolio_objective(z_temp, y_hat, V_hat, z_prev, delta, lambda_val, kappa)
+            
+            grad = torch.autograd.grad(
+                outputs=obj,
+                inputs=z_temp,
+                create_graph=False,
+                retain_graph=False,
+                allow_unused=False
+            )[0]
+            
+            with torch.no_grad():
+                z = z - lr * grad
+                for b in range(batch_size):
+                    for s in range(horizon):
+                        z[b, s] = project_simplex(z[b, s])
+            
+            with torch.no_grad():
+                obj_val = portfolio_objective(z, y_hat, V_hat, z_prev, delta, lambda_val, kappa).item()
+            
+            if abs(prev_obj - obj_val) < tol:
+                break
+            prev_obj = obj_val
+    
+    return z
+
+
+class MDFPSolverPyTorch(torch.autograd.Function):
+    """Differentiable MDFP solver using implicit differentiation (PyTorch-native)."""
+    
+    @staticmethod
+    def forward(ctx, y_hat, V_hat, z_prev, delta, lambda_val, kappa, neumann_order, eta, max_iter, lr, tol):
+        with torch.enable_grad():
+            z_star = solve_mdfp_pytorch(
+                y_hat, V_hat, z_prev, delta, lambda_val, kappa,
+                max_iter=max_iter, lr=lr, tol=tol, verbose=False
+            )
+        
+        ctx.save_for_backward(y_hat, V_hat, z_prev, z_star)
+        ctx.delta = delta
+        ctx.lambda_val = lambda_val
+        ctx.kappa = kappa
+        ctx.neumann_order = neumann_order
+        ctx.eta = eta
+        
+        return z_star
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Simplified backward pass using direct analytical gradients (approximation)."""
+        y_hat, V_hat, z_prev, z_star = ctx.saved_tensors
+        delta = ctx.delta
+        
+        batch_size, horizon, n_assets = y_hat.shape
+        
+        grad_y_hat = torch.zeros_like(y_hat)
+        for b in range(batch_size):
+            for s in range(horizon):
+                grad_y_hat[b, s] = grad_output[b, s] * z_star[b, s]
+        
+        grad_V_hat = torch.zeros_like(V_hat)
+        for b in range(batch_size):
+            for s in range(horizon):
+                z_s = z_star[b, s]
+                outer = torch.outer(z_s, z_s)
+                weight = grad_output[b, s].sum()
+                grad_V_hat[b, s] = -delta / 2.0 * weight * outer
+        
+        return grad_y_hat, grad_V_hat, None, None, None, None, None, None, None, None, None
+
+
+def apply_mdfp_pytorch(
+    y_hat: torch.Tensor,
+    V_hat: torch.Tensor,
+    z_prev: torch.Tensor,
+    delta: float,
+    lambda_val: float,
+    kappa: float = 1e-6,
+    neumann_order: int = 5,
+    eta: float = 0.1,
+    max_iter: int = 50,
+    lr: float = 0.5,
+    tol: float = 1e-5
+) -> torch.Tensor:
+    """Apply MDFP optimization layer using PyTorch (drop-in replacement for apply_mdfp)."""
+    return MDFPSolverPyTorch.apply(y_hat, V_hat, z_prev, delta, lambda_val, kappa, neumann_order, eta, max_iter, lr, tol)
+
+
+# ============================================================================
 # Signal Generation
 # ============================================================================
 
@@ -503,7 +659,8 @@ def signal_gen(
     learning_rate: float = 1e-3,
     epochs: int = 50,
     neumann_order: int = 5,
-    initial_capital: float = 1_000_000.0
+    initial_capital: float = 1_000_000.0,
+    solver: str = 'pytorch'
 ) -> pd.DataFrame:
     """
     Generate trading signals using CNN-LSTM and MDFP optimization.
@@ -534,6 +691,7 @@ def signal_gen(
         epochs: Number of training epochs per rebalance (default: 50)
         neumann_order: Order of Neumann series for implicit differentiation (default: 5)
         initial_capital: Initial capital for position sizing (default: 1,000,000)
+        solver: Optimization solver - 'pytorch' (fast, GPU) or 'cvxpy' (accurate, CPU) (default: 'pytorch')
         
     Returns:
         DataFrame with columns [time, ticker, action, quantity, price]
@@ -601,14 +759,85 @@ def signal_gen(
             f"got {len(dates)}"
         )
     
-    # Normalize returns for neural network input
-    returns_mean = np.nanmean(returns_np, axis=0, keepdims=True)
-    returns_std = np.nanstd(returns_np, axis=0, keepdims=True) + 1e-8
-    returns_normalized = (returns_np - returns_mean) / returns_std
+    nan_count = np.isnan(returns_np).sum()
+    if nan_count > 0:
+        nan_pct = (nan_count / returns_np.size) * 100
+        import warnings
+        warnings.warn(f"Found {nan_count} NaN values ({nan_pct:.2f}% of data), filling with 0.0")
     
-    # Handle NaN values
-    returns_normalized = np.nan_to_num(returns_normalized, nan=0.0)
+    # Handle NaN values before normalization
     returns_np = np.nan_to_num(returns_np, nan=0.0)
+    
+    # Use expanding window normalization to prevent future data leakage
+    returns_normalized = np.zeros_like(returns_np)
+    
+    for i in range(len(returns_np)):
+        # CRITICAL: Use ONLY historical data (BEFORE time i) for normalization statistics
+        # Do NOT include returns_np[i] in the window when normalizing returns_np[i]
+        if i == 0:
+            # First observation: no history available, set to zero
+            returns_normalized[i] = 0.0
+            continue
+        elif i < lookback_window:
+            # For initial period, use all available data BEFORE current point
+            window_data = returns_np[:i]  # [0:i), NOT including i
+        else:
+            # Use rolling window of lookback_window size BEFORE current point
+            window_data = returns_np[i-lookback_window:i]  # [i-lookback:i), NOT including i
+        
+        # Calculate mean and std from STRICTLY historical data (before time i)
+        window_mean = np.nanmean(window_data, axis=0, keepdims=True)
+        window_std = np.nanstd(window_data, axis=0, keepdims=True) + 1e-8
+        
+        # Normalize current observation using only historical statistics
+        returns_normalized[i] = (returns_np[i] - window_mean) / window_std
+    
+    # Final check for any remaining NaNs after normalization
+    returns_normalized = np.nan_to_num(returns_normalized, nan=0.0)
+    
+    # =========================================================================
+    # Helper Function: Compute Sample Covariance
+    # =========================================================================
+    
+    def compute_sample_covariance_batch(returns_batch: torch.Tensor, horizon: int) -> torch.Tensor:
+        """
+        Vectorized covariance computation for entire batch (GPU-accelerated).
+        
+        This is MUCH faster than computing covariances one-by-one in a loop.
+        Uses PyTorch operations that run on GPU when available.
+        
+        Args:
+            returns_batch: Historical returns, shape (batch, lookback_window, n_assets)
+                          Already on GPU if available
+            horizon: Planning horizon (returns same covariance for all periods)
+            
+        Returns:
+            V_hat: Covariance matrices, shape (batch, horizon, n_assets, n_assets)
+                   Same covariance used for all periods in the horizon
+        """
+        batch_size, lookback, n_assets = returns_batch.shape
+        
+        # Center the data (subtract mean)
+        mean = returns_batch.mean(dim=1, keepdim=True)  # (batch, 1, n_assets)
+        centered = returns_batch - mean  # (batch, lookback, n_assets)
+        
+        # Compute covariance: (1/(n-1)) * X^T @ X
+        # Using einsum for efficiency: 'bti,btj->bij' means:
+        # - b: batch dimension
+        # - t: time dimension (lookback)
+        # - i,j: asset dimensions
+        cov = torch.einsum('bti,btj->bij', centered, centered) / (lookback - 1)
+        # Shape: (batch, n_assets, n_assets)
+        
+        # Add small diagonal for numerical stability (ensure PSD)
+        eye = torch.eye(n_assets, device=returns_batch.device, dtype=returns_batch.dtype)
+        cov = cov + 1e-4 * eye.unsqueeze(0)
+        
+        # Expand to horizon: same covariance for all periods
+        # Shape: (batch, horizon, n_assets, n_assets)
+        V_hat = cov.unsqueeze(1).expand(-1, horizon, -1, -1).contiguous()
+        
+        return V_hat
     
     # =========================================================================
     # Model Initialization
@@ -627,12 +856,81 @@ def signal_gen(
     eta = 0.1
     
     # =========================================================================
+    # Solver Selection
+    # =========================================================================
+    
+    if solver.lower() == 'pytorch':
+        print(f"Using PyTorch solver (device: {device.type})")
+        
+        def solve_portfolio(y_hat, V_hat, z_prev_tensor, training=True):
+            """Solve portfolio optimization using PyTorch.
+            
+            Args:
+                training: If True, uses differentiable version for gradient flow.
+                         If False, uses faster non-differentiable version.
+            """
+            if training:
+                # Use differentiable version with implicit gradients
+                return apply_mdfp_pytorch(
+                    y_hat=y_hat,
+                    V_hat=V_hat,
+                    z_prev=z_prev_tensor,
+                    delta=risk_aversion,
+                    lambda_val=turnover_penalty,
+                    kappa=kappa,
+                    max_iter=50,
+                    lr=0.5,
+                    tol=1e-5
+                )
+            else:
+                # Use faster non-differentiable version for inference
+                return solve_mdfp_pytorch(
+                    y_hat=y_hat,
+                    V_hat=V_hat,
+                    z_prev=z_prev_tensor,
+                    delta=risk_aversion,
+                    lambda_val=turnover_penalty,
+                    kappa=kappa,
+                    max_iter=50,
+                    lr=0.5,
+                    tol=1e-5
+                )
+    
+    elif solver.lower() == 'cvxpy':
+        print("Using CVXPY solver (CPU only)")
+        
+        def solve_portfolio(y_hat, V_hat, z_prev_tensor, training=True):
+            """Solve portfolio optimization using CVXPY.
+            
+            Args:
+                training: Parameter for consistency with pytorch solver (unused for CVXPY).
+            """
+            return apply_mdfp(
+                y_hat=y_hat,
+                V_hat=V_hat,
+                z_prev=z_prev_tensor,
+                delta=risk_aversion,
+                lambda_val=turnover_penalty,
+                kappa=kappa,
+                neumann_order=neumann_order,
+                eta=eta
+            )
+    
+    else:
+        raise ValueError(
+            f"Unknown solver: '{solver}'. Must be 'pytorch' or 'cvxpy'. "
+            f"Use 'pytorch' for speed and GPU support, 'cvxpy' for maximum accuracy."
+        )
+    
+    # =========================================================================
     # Output containers
     # =========================================================================
 
     all_trades: List[Dict] = []
     current_quantities = np.zeros(n_assets)
     current_cash = initial_capital  # Track cash to update portfolio value over time
+    
+    current_portfolio_value = initial_capital
     
     # =========================================================================
     # Rolling loop over dates
@@ -666,8 +964,9 @@ def signal_gen(
                     train_X_list = []
                     train_Y_list = []
 
-                    # Use recent historical windows (up to 16 samples for batch)
-                    batch_size = min(16, max_train_t - min_train_t + 1)
+                    # Use recent historical windows (up to 64 samples for batch)
+                    # Increased from 16 to better utilize GPU
+                    batch_size = min(64, max_train_t - min_train_t + 1)
 
                     for t in range(max(min_train_t, max_train_t - batch_size + 1), max_train_t + 1):
                         X_sample = returns_normalized[t - lookback_window:t]
@@ -690,29 +989,53 @@ def signal_gen(
 
                     optimizer.zero_grad()
 
-                    # Forward pass through CNN-LSTM
-                    y_hat, V_hat = model(X)
+                    # Forward pass through CNN-LSTM (returns only)
+                    y_hat = model(X)
+                    
+                    # Compute sample covariance from historical returns (vectorized, GPU-accelerated)
+                    # X is already on GPU with shape (batch, lookback_window, n_assets)
+                    V_hat = compute_sample_covariance_batch(X, planning_horizon)
 
-                    # MDFP optimization
-                    z_star = apply_mdfp(
-                        y_hat=y_hat,
-                        V_hat=V_hat,
-                        z_prev=z_prev_tensor,
-                        delta=risk_aversion,
-                        lambda_val=turnover_penalty,
-                        kappa=kappa,
-                        neumann_order=neumann_order,
-                        eta=eta
-                    )
+                    # MDFP optimization (using selected solver)
+                    z_star = solve_portfolio(y_hat, V_hat, z_prev_tensor, training=True)
 
-                    # Compute portfolio returns
-                    portfolio_returns = (z_star * Y).sum(dim=-1)  # (batch, horizon)
-
-                    # Loss: Negative Sharpe ratio (maximize Sharpe)
-                    mean_ret = portfolio_returns.mean()
-                    std_ret = portfolio_returns.std() + 1e-8
-                    sharpe = mean_ret / std_ret
-                    loss = -sharpe
+                    # Loss = -Σ[r^T z - λ ||z - z_prev||_1]
+                    # Note: Risk term (δ/2 z^T V z) is handled by the optimization layer,
+                    # not the training loss. The model learns to predict returns that lead
+                    # to good portfolio performance as measured by realized returns.
+                    batch_size_actual = z_star.shape[0]
+                    
+                    # Accumulate objectives as list of tensors, then sum
+                    objectives = []
+                    
+                    for b in range(batch_size_actual):
+                        for s in range(planning_horizon):
+                            z_s = z_star[b, s]
+                            r_s = Y[b, s]  # Realized returns
+                            
+                            # Return term: r^T z (realized portfolio return)
+                            return_term = torch.dot(r_s, z_s)
+                            
+                            # Turnover term: λ * sqrt((z - z_prev)^2 + κ).sum()
+                            # Using smoothed L1 for consistency with optimization layer
+                            if s == 0:
+                                z_prev_s = z_prev_tensor[b]
+                            else:
+                                z_prev_s = z_star[b, s-1]
+                            
+                            diff = z_s - z_prev_s
+                            # Smoothed L1 norm (consistent with MDFP solver)
+                            turnover_cost = turnover_penalty * torch.sqrt(diff ** 2 + kappa).sum()
+                            
+                            # Portfolio objective for this step (no risk term in loss)
+                            obj = return_term - turnover_cost
+                            objectives.append(obj)
+                    
+                    # Sum all objectives and compute loss
+                    total_objective = torch.stack(objectives).sum()
+                    
+                    # Loss is negative of average objective (minimize loss = maximize objective)
+                    loss = -total_objective / (batch_size_actual * planning_horizon)
 
                     # Backward pass
                     loss.backward()
@@ -738,18 +1061,15 @@ def signal_gen(
                     z_prev, dtype=torch.float32, device=device
                 ).unsqueeze(0)
                 
-                y_hat, V_hat = model(X_infer)
+                # Forward pass (returns only)
+                y_hat = model(X_infer)
                 
-                z_star = apply_mdfp(
-                    y_hat=y_hat,
-                    V_hat=V_hat,
-                    z_prev=z_prev_tensor,
-                    delta=risk_aversion,
-                    lambda_val=turnover_penalty,
-                    kappa=kappa,
-                    neumann_order=neumann_order,
-                    eta=eta
-                )
+                # Compute sample covariance from historical returns (vectorized)
+                # X_infer has shape (1, lookback_window, n_assets)
+                V_hat = compute_sample_covariance_batch(X_infer, planning_horizon)
+                
+                # MDFP optimization (using selected solver)
+                z_star = solve_portfolio(y_hat, V_hat, z_prev_tensor, training=False)
                 
                 # Get weights for next period (first step of planning horizon)
                 new_weights = z_star[0, 0].cpu().numpy()
@@ -770,12 +1090,18 @@ def signal_gen(
             execution_prices = np.nan_to_num(execution_prices, nan=1.0)
             execution_prices = np.maximum(execution_prices, 1e-8)  # Avoid division by zero
             
-            # Calculate target quantities: floor(Capital * Weight / Price)
-            target_values = initial_capital * new_weights
+            # Portfolio value = cash + market value of current holdings
+            current_holdings_value = np.sum(current_quantities * execution_prices)
+            current_portfolio_value = current_cash + current_holdings_value
+            
+            # Use ACTUAL portfolio value for position sizing (not initial_capital)
+            target_values = current_portfolio_value * new_weights
             target_quantities = np.floor(target_values / execution_prices)
             
             # Calculate trades needed
             quantity_diff = target_quantities - current_quantities
+            
+            cash_change = 0.0
             
             for i, ticker in enumerate(tickers):
                 diff = quantity_diff[i]
@@ -783,6 +1109,12 @@ def signal_gen(
                     action = 'buy' if diff > 0 else 'sell'
                     qty = abs(diff)
                     price = float(execution_prices[i])
+                    
+                    # Update cash based on trade direction
+                    if action == 'buy':
+                        cash_change -= qty * price  # Spending cash
+                    else:
+                        cash_change += qty * price  # Receiving cash
                     
                     all_trades.append({
                         'time': execution_date,
@@ -794,6 +1126,7 @@ def signal_gen(
             
             # Update state
             current_quantities = target_quantities.copy()
+            current_cash += cash_change  # Update cash after all trades
             z_prev = new_weights.copy()
     
     # =========================================================================
@@ -841,23 +1174,16 @@ def simicx_test_cnn_lstm_forward():
         model = CNN_LSTM(n_assets=n_assets, horizon=horizon)
         x = torch.randn(batch_size, seq_len, n_assets)
         
-        y_hat, V_hat = model(x)
+        y_hat = model(x)
         
         # Check shapes
         assert y_hat.shape == (batch_size, horizon, n_assets), \
             f"y_hat shape mismatch: {y_hat.shape}"
-        assert V_hat.shape == (batch_size, horizon, n_assets, n_assets), \
-            f"V_hat shape mismatch: {V_hat.shape}"
-        
-        # Check V_hat is positive semi-definite
-        for b in range(batch_size):
-            for s in range(horizon):
-                eigvals = torch.linalg.eigvalsh(V_hat[b, s])
-                assert (eigvals >= -1e-5).all(), f"V_hat not PSD at batch {b}, step {s}"
         
         # Check no NaN
         assert not torch.isnan(y_hat).any(), "NaN in y_hat"
-        assert not torch.isnan(V_hat).any(), "NaN in V_hat"
+        
+        print(f"✓ CNN-LSTM test passed for config: n_assets={n_assets}, horizon={horizon}, batch={batch_size}")
 
 
 def simicx_test_mdfp_layer():

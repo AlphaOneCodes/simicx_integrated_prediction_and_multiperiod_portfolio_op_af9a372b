@@ -159,7 +159,7 @@ def get_tickers_for_phase(phase: str, config: Dict[str, Any]) -> List[str]:
     return config[key]
 
 
-def run_production(phase: str) -> Dict[str, Any]:
+def run_production(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
     """Run production trading pipeline.
     
     Executes the full production pipeline:
@@ -171,6 +171,7 @@ def run_production(phase: str) -> Dict[str, Any]:
     
     Args:
         phase: Data phase to use - 'limited' or 'full'.
+        solver: Optimization solver - 'pytorch' (fast) or 'cvxpy' (accurate). Default: 'pytorch'
         
     Returns:
         Dictionary containing:
@@ -227,6 +228,7 @@ def run_production(phase: str) -> Dict[str, Any]:
         epochs=best_params["epochs"],
         neumann_order=best_params["neumann_order"],
         initial_capital=DEFAULT_INITIAL_CAPITAL,
+        solver=solver,
     )
     print(f"  Generated {len(trading_sheet)} trade signals")
     
@@ -284,14 +286,16 @@ def parse_args() -> Dict[str, str]:
     Returns:
         Dictionary with parsed arguments:
             - phase: str - Either 'limited' or 'full'
+            - solver: str - Either 'pytorch' or 'cvxpy'
 
     Example:
-        >>> # From command line: python main.py --phase limited
+        >>> # From command line: python main.py --phase limited --solver pytorch
         >>> args = parse_args()
         >>> args['phase']
         'limited'
     """
     phase = "limited"  # default
+    solver = "pytorch"  # default
 
     args = sys.argv[1:]
     i = 0
@@ -306,21 +310,30 @@ def parse_args() -> Dict[str, str]:
             else:
                 print("Error: --phase requires a value", file=sys.stderr)
                 sys.exit(1)
+        elif args[i] == "--solver":
+            if i + 1 < len(args):
+                solver = args[i + 1]
+                if solver not in ("pytorch", "cvxpy"):
+                    print(f"Error: --solver must be 'pytorch' or 'cvxpy', got '{solver}'", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            else:
+                print("Error: --solver requires a value", file=sys.stderr)
+                sys.exit(1)
         elif args[i] in ("-h", "--help"):
             print("Production execution for CNN-LSTM portfolio optimization.")
-            print("Usage: python main.py [--phase {limited,full}]")
+            print("Usage: python main.py [--phase {limited,full}] [--solver {pytorch,cvxpy}]")
             print("Options:")
             print("  --phase {limited,full}  Trading phase: 'limited' uses fewer tickers,")
             print("                          'full' uses all tickers. (default: limited)")
+            print("  --solver {pytorch,cvxpy}  Solver: 'pytorch' (fast, GPU) or 'cvxpy' (accurate, CPU)")
+            print("                          (default: pytorch)")
             sys.exit(0)
         else:
             print(f"Unknown argument: {args[i]}", file=sys.stderr)
             sys.exit(1)
 
-    return {"phase": phase}
-
-
-    run_production(phase=args["phase"])
+    return {"phase": phase, "solver": solver}
 
 
 # =============================================================================
@@ -333,10 +346,11 @@ def main() -> None:
 
     Example:
         $ python main.py --phase limited
-        $ python main.py --phase full
+        $ python main.py --phase full --solver pytorch
+        $ python main.py --phase limited --solver cvxpy
     """
     args = parse_args()
-    run_production(phase=args["phase"])
+    run_production(phase=args["phase"], solver=args["solver"])
 
 
 # =============================================================================

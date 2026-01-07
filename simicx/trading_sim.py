@@ -857,7 +857,8 @@ def trading_sim(
     allow_short: bool = False,
     allow_leverage: bool = False,
     max_position_pct: float = 0.25,
-    risk_free_rate: float = 0.02
+    risk_free_rate: float = 0.02,
+    ohlcv_tickers: Optional[List[str]] = None
 ) -> Tuple[float, pd.DataFrame]:
     """
     Comprehensive trading simulation/backtesting engine.
@@ -879,6 +880,9 @@ def trading_sim(
         allow_leverage: Allow leverage/margin (default False)
         max_position_pct: Max single position as pct of portfolio (default 25%)
         risk_free_rate: Annual risk-free rate for metrics (default 2%)
+        ohlcv_tickers: List of tickers to load OHLCV data for. If None, uses LIMITED_TICKERS.
+                      Set this to match the tickers used in signal generation to avoid
+                      "Ticker not found" errors.
         
     Returns:
         Tuple of:
@@ -891,14 +895,20 @@ def trading_sim(
     """
     # Load and validate inputs
     try:
-        from simicx.data_loader import get_data, LIMITED_TICKERS
+        from simicx.data_loader import get_data, LIMITED_TICKERS, FULL_TICKERS
     except ImportError:
         try:
-            from src.data_loader import get_data, LIMITED_TICKERS
+            from src.data_loader import get_data, LIMITED_TICKERS, FULL_TICKERS
         except ImportError:
-            from data_loader import get_data, LIMITED_TICKERS
+            from data_loader import get_data, LIMITED_TICKERS, FULL_TICKERS
 
-    ohlcv_df = get_data(tickers=LIMITED_TICKERS)
+    # Determine which tickers to load
+    if ohlcv_tickers is None:
+        tickers_to_load = LIMITED_TICKERS
+    else:
+        tickers_to_load = ohlcv_tickers
+    
+    ohlcv_df = get_data(tickers=tickers_to_load)
     
     # --- Input Processing ---
     if signals is not None and not signals.empty:
