@@ -824,9 +824,10 @@ def convert_signals_to_trades(
                 target_qtys[t] = qty
         
         # 3. Generate Rebalancing Orders
+        # IMPORTANT: Sort tickers for deterministic order (sets are non-deterministic)
         active_tickers = set(target_qtys.keys()) | {t for t, q in current_positions.items() if q != 0}
         
-        for ticker in active_tickers:
+        for ticker in sorted(active_tickers):  # Sort for reproducibility
             tgt_qty = target_qtys.get(ticker, 0.0)
             cur_qty = current_positions.get(ticker, 0.0)
             

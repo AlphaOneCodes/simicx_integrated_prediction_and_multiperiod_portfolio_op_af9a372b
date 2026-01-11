@@ -86,6 +86,7 @@ TRAINING_YEARS_BACK_FULL = CONFIG.get("TRAINING_YEARS_BACK_FULL", None)
 # CRITICAL: Strict enforcement - no fallback allowed
 MONGODB_URI = os.environ.get("SIMICX_MONGODB_URI")
 MONGODB_DATABASE = os.environ.get("SIMICX_MONGODB_DATABASE")
+
 OHLCV_COLLECTION = "US_stock_etf_daily_ohlcv"
 
 if not MONGODB_URI:

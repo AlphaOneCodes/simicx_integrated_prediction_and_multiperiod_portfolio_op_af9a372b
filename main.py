@@ -19,7 +19,7 @@ import pandas as pd
 
 from signal_gen import signal_gen
 from simicx.trading_sim import trading_sim
-from simicx.data_loader import get_trading_data, get_data
+from simicx.data_loader import get_data
 
 
 # Configuration paths
@@ -30,6 +30,46 @@ OUTPUT_PNL = Path("pnl.csv")
 
 # Default initial capital (not in best_params.json per data contract)
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
+
+# Trading start date constant (from data_loader)
+TRADING_START_DATE = "2025-01-01"
+
+
+def get_trading_data_with_warmup(
+    tickers: List[str],
+    warmup_days: int = 365,
+    align_dates: bool = True
+) -> pd.DataFrame:
+    """Get trading data with historical warmup period for model training.
+    
+    This function loads data from (TRADING_START_DATE - warmup_days) onwards,
+    providing sufficient historical data for model training before the first trade
+    executes on 2025-01-01.
+    
+    Args:
+        tickers: List of ticker symbols.
+        warmup_days: Number of days before TRADING_START_DATE to load for warmup.
+                     Default 365 provides ~1 year of historical data for training.
+        align_dates: If True, only return dates where ALL tickers have data.
+    
+    Returns:
+        pd.DataFrame: OHLCV data including warmup period and trading period.
+    """
+    # Calculate warmup start date
+    trading_start = pd.Timestamp(TRADING_START_DATE)
+    warmup_start = trading_start - pd.Timedelta(days=warmup_days)
+    warmup_start_str = warmup_start.strftime('%Y-%m-%d')
+    
+    print(f"Loading data with {warmup_days}-day warmup:")
+    print(f"  Warmup start: {warmup_start_str}")
+    print(f"  Trading start: {TRADING_START_DATE}")
+    
+    return get_data(
+        tickers=tickers,
+        start_date=warmup_start_str,
+        end_date=None,
+        align_dates=align_dates
+    )
 
 
 def load_alpha_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
@@ -159,7 +199,7 @@ def get_tickers_for_phase(phase: str, config: Dict[str, Any]) -> List[str]:
     return config[key]
 
 
-def run_production(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
+def run_production(phase: str) -> Dict[str, Any]:
     """Run production trading pipeline.
     
     Executes the full production pipeline:
@@ -171,7 +211,6 @@ def run_production(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
     
     Args:
         phase: Data phase to use - 'limited' or 'full'.
-        solver: Optimization solver - 'pytorch' (fast) or 'cvxpy' (accurate). Default: 'pytorch'
         
     Returns:
         Dictionary containing:
@@ -209,17 +248,25 @@ def run_production(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
     ticker_preview = tickers[:5]
     print(f"  Using {len(tickers)} tickers: {ticker_preview}{'...' if len(tickers) > 5 else ''}")
     
-    # Step 3: Load trading data (2025 onwards)
-    print("\n[3/5] Loading trading data (2025 onwards)...")
-    ohlcv_df = get_trading_data(tickers=tickers, align_dates=True)
+    # Step 3: Load trading data with warmup period
+    print("\n[3/5] Loading trading data with warmup period...")
+    ohlcv_df = get_trading_data_with_warmup(
+        tickers=tickers,
+        warmup_days=365,  # 1 year of historical data for model warmup
+        align_dates=True
+    )
     print(f"  Loaded {len(ohlcv_df)} records")
     print(f"  Date range: {ohlcv_df['time'].min()} to {ohlcv_df['time'].max()}")
     
     # Step 4: Generate trading signals
     print("\n[4/5] Generating trading signals...")
+    print("  Trading will start from: 2025-01-01")
+    print("  Pre-2025 data will be used for model warmup only")
     trading_sheet = signal_gen(
         ohlcv_df=ohlcv_df,
+        trading_start_date="2025-01-01",  # Explicitly set trading start date
         lookback_window=best_params["lookback_window"],
+        training_window=250,  # Keep 250 for proper warmup (not in best_params)
         planning_horizon=best_params["planning_horizon"],
         rebalance_freq=best_params["rebalance_freq"],
         risk_aversion=best_params["risk_aversion"],
@@ -228,7 +275,6 @@ def run_production(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
         epochs=best_params["epochs"],
         neumann_order=best_params["neumann_order"],
         initial_capital=DEFAULT_INITIAL_CAPITAL,
-        solver=solver,
     )
     print(f"  Generated {len(trading_sheet)} trade signals")
     
@@ -247,6 +293,7 @@ def run_production(phase: str, solver: str = 'pytorch') -> Dict[str, Any]:
         allow_leverage=False,
         max_position_pct=0.25,
         risk_free_rate=0.02,
+        ohlcv_tickers=tickers,
     )
     
     # Extract metrics from pnl_details attrs
@@ -286,16 +333,14 @@ def parse_args() -> Dict[str, str]:
     Returns:
         Dictionary with parsed arguments:
             - phase: str - Either 'limited' or 'full'
-            - solver: str - Either 'pytorch' or 'cvxpy'
 
     Example:
-        >>> # From command line: python main.py --phase limited --solver pytorch
+        >>> # From command line: python main.py --phase limited
         >>> args = parse_args()
         >>> args['phase']
         'limited'
     """
     phase = "limited"  # default
-    solver = "pytorch"  # default
 
     args = sys.argv[1:]
     i = 0
@@ -310,30 +355,21 @@ def parse_args() -> Dict[str, str]:
             else:
                 print("Error: --phase requires a value", file=sys.stderr)
                 sys.exit(1)
-        elif args[i] == "--solver":
-            if i + 1 < len(args):
-                solver = args[i + 1]
-                if solver not in ("pytorch", "cvxpy"):
-                    print(f"Error: --solver must be 'pytorch' or 'cvxpy', got '{solver}'", file=sys.stderr)
-                    sys.exit(1)
-                i += 2
-            else:
-                print("Error: --solver requires a value", file=sys.stderr)
-                sys.exit(1)
         elif args[i] in ("-h", "--help"):
             print("Production execution for CNN-LSTM portfolio optimization.")
-            print("Usage: python main.py [--phase {limited,full}] [--solver {pytorch,cvxpy}]")
+            print("Usage: python main.py [--phase {limited,full}]")
             print("Options:")
             print("  --phase {limited,full}  Trading phase: 'limited' uses fewer tickers,")
             print("                          'full' uses all tickers. (default: limited)")
-            print("  --solver {pytorch,cvxpy}  Solver: 'pytorch' (fast, GPU) or 'cvxpy' (accurate, CPU)")
-            print("                          (default: pytorch)")
             sys.exit(0)
         else:
             print(f"Unknown argument: {args[i]}", file=sys.stderr)
             sys.exit(1)
 
-    return {"phase": phase, "solver": solver}
+    return {"phase": phase}
+
+
+    run_production(phase=args["phase"])
 
 
 # =============================================================================
@@ -346,11 +382,10 @@ def main() -> None:
 
     Example:
         $ python main.py --phase limited
-        $ python main.py --phase full --solver pytorch
-        $ python main.py --phase limited --solver cvxpy
+        $ python main.py --phase full
     """
     args = parse_args()
-    run_production(phase=args["phase"], solver=args["solver"])
+    run_production(phase=args["phase"])
 
 
 # =============================================================================
