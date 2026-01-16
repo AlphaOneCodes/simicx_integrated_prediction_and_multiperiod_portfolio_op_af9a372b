@@ -26,7 +26,7 @@ from simicx.data_loader import get_data
 CONFIG_PATH = Path("simicx/alpha_config.json")
 BEST_PARAMS_PATH = Path(__file__).resolve().parent / "best_params.json"
 OUTPUT_TRADING_SHEET = Path("trading_sheet.csv")
-OUTPUT_PNL = Path("pnl.csv")
+OUTPUT_PNL = Path("pnl_details.csv")
 
 # Default initial capital (not in best_params.json per data contract)
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
